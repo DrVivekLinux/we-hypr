@@ -293,7 +293,7 @@ def run_wallpaper(wallpaper_id=None, cfg=None, foreground=False):
         return True, wallpaper_id
 
     if is_service_active():
-        subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=False)
+        subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         return True, wallpaper_id
 
     kill_stray_instances()
