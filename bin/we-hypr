@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-we-hypr: Wallpaper Engine manager for Hyprland and Linux
+we-hypr: Universal Wallpaper Engine manager for Hyprland
 Supports native Wayland layer-shell via linux-wallpaperengine.
-Includes intelligent auto-pause for windows and battery saving.
+Compatible with all Hyprland setups (Dux Shell, Rofi, Wofi, Fuzzel, Waybar, etc.).
 """
 
 import os
@@ -10,6 +10,7 @@ import sys
 import time
 import json
 import glob
+import shutil
 import socket
 import threading
 import subprocess
@@ -24,7 +25,7 @@ SERVICE_NAME = "wallpaper-engine.service"
 BATTERY_SERVICE_NAME = "wallpaper-battery-saver.service"
 
 DEFAULT_CONFIG = {
-    "wallpaper_id": "3581781970", # macos Tahoe Dark
+    "wallpaper_id": "3581781970",
     "fps": 30,
     "scaling": "fill",
     "silent": True,
@@ -164,14 +165,27 @@ def should_pause(cfg=None):
     return False, "Desktop is clear"
 
 def notify(summary, body):
-    try:
-        subprocess.run(
-            ["dms", "notify", summary, body, "-a", "Wallpaper Engine", "-u", "low", "-e"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        pass
+    """Universal notification dispatcher (notify-send or dms notify)."""
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(
+                ["notify-send", "-a", "Wallpaper Engine", "-u", "low", summary, body],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return
+        except Exception:
+            pass
+
+    if shutil.which("dms"):
+        try:
+            subprocess.run(
+                ["dms", "notify", summary, body, "-a", "Wallpaper Engine", "-u", "low", "-e"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
 
 def get_engine_pids():
     try:
@@ -257,7 +271,6 @@ def build_command(wallpaper_id, cfg):
     else:
         cmd.extend(["--volume", str(cfg.get("volume", 15))])
 
-    # Assign all active screens
     for mon in monitors:
         cmd.extend(["--screen-root", mon, "--bg", str(wallpaper_id)])
 
@@ -273,19 +286,16 @@ def run_wallpaper(wallpaper_id=None, cfg=None, foreground=False):
     else:
         wallpaper_id = cfg.get("wallpaper_id", DEFAULT_CONFIG["wallpaper_id"])
 
-    # If running in foreground (e.g. systemd service):
     if foreground:
         kill_stray_instances(exclude_pid=os.getpid())
         cmd = build_command(wallpaper_id, cfg)
         os.execvp(cmd[0], cmd)
         return True, wallpaper_id
 
-    # If systemd service is active:
     if is_service_active():
         subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=False)
         return True, wallpaper_id
 
-    # Otherwise kill stray instances and launch detached
     kill_stray_instances()
     cmd = build_command(wallpaper_id, cfg)
 
@@ -326,6 +336,38 @@ def find_wallpaper(query):
             return w
     return None
 
+def show_picker_menu(prompt, items_text):
+    """
+    Universal dmenu launcher selector.
+    Supports: dms dmenu, rofi, wofi, fuzzel, tofi, bemenu.
+    """
+    candidate_cmds = [
+        ["dms", "dmenu", "-p", prompt],
+        ["rofi", "-dmenu", "-p", prompt, "-i"],
+        ["wofi", "--dmenu", "-p", prompt, "-i"],
+        ["fuzzel", "--dmenu", "-p", prompt],
+        ["tofi", "--prompt-text", prompt],
+        ["bemenu", "-p", prompt, "-i"]
+    ]
+
+    for cmd in candidate_cmds:
+        binary = cmd[0]
+        if shutil.which(binary):
+            try:
+                res = subprocess.run(
+                    cmd,
+                    input=items_text,
+                    capture_output=True,
+                    text=True
+                )
+                if res.returncode == 0:
+                    return res.stdout.strip()
+                elif res.returncode == 1:
+                    return None
+            except Exception:
+                continue
+    return None
+
 def pick_wallpaper_gui():
     wallpapers = get_installed_wallpapers()
     if not wallpapers:
@@ -340,22 +382,14 @@ def pick_wallpaper_gui():
         id_map[entry] = w["id"]
 
     menu_input = "\n".join(lines)
-
+    selected = show_picker_menu("Wallpaper Engine:", menu_input)
     chosen_id = None
-    try:
-        res = subprocess.run(
-            ["dms", "dmenu", "-p", "Wallpaper Engine:"],
-            input=menu_input,
-            capture_output=True,
-            text=True
-        )
-        selected = res.stdout.strip()
-        if selected and selected in id_map:
-            chosen_id = id_map[selected]
-    except FileNotFoundError:
-        pass
 
-    if not chosen_id:
+    if selected and selected in id_map:
+        chosen_id = id_map[selected]
+
+    if not chosen_id and not selected:
+        # Fallback to terminal input if run interactively in terminal
         if sys.stdin.isatty():
             print("\nSelect a wallpaper by number, name or ID:")
             for idx, w in enumerate(wallpapers, 1):
@@ -390,7 +424,6 @@ def run_watcher_daemon():
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
-    # Small delay for initial wallpaper render
     time.sleep(1)
 
     def evaluate():
@@ -403,10 +436,8 @@ def run_watcher_daemon():
         elif not need_pause and paused:
             resume_wallpaper()
 
-    # Initial evaluation
     evaluate()
 
-    # 1. Listen for battery / AC power changes
     def on_upower_changed(interface, changed, invalidated):
         if "OnBattery" in changed:
             on_bat = bool(changed["OnBattery"])
@@ -423,7 +454,6 @@ def run_watcher_daemon():
         path="/org/freedesktop/UPower"
     )
 
-    # 2. Background thread to listen for Hyprland window/workspace events
     def hyprland_event_thread():
         relevant_prefixes = ("workspace>>", "activewindow>>", "openwindow>>", "closewindow>>", "movewindow>>", "fullscreen>>")
         while True:
@@ -444,7 +474,6 @@ def run_watcher_daemon():
                     buf = lines[-1]
                     for line in lines[:-1]:
                         if any(line.startswith(pref) for pref in relevant_prefixes):
-                            # Small debounce delay to allow Hyprland state to settle
                             time.sleep(0.04)
                             GLib.idle_add(evaluate)
             except Exception:
@@ -465,29 +494,24 @@ def run_watcher_daemon():
         pass
 
 def main():
-    parser = argparse.ArgumentParser(description="Wallpaper Engine CLI for Hyprland")
+    parser = argparse.ArgumentParser(description="Universal Wallpaper Engine CLI for Hyprland")
     subparsers = parser.add_subparsers(dest="command")
 
-    # default pick
     subparsers.add_parser("pick", help="Open GUI/interactive picker to choose wallpaper")
     subparsers.add_parser("list", help="List all downloaded wallpapers")
     subparsers.add_parser("stop", help="Stop Wallpaper Engine")
     subparsers.add_parser("status", help="Show current Wallpaper Engine status")
 
-    # power saving pause/resume
     subparsers.add_parser("pause", help="Freeze animation (0%% CPU/GPU, static image)")
     subparsers.add_parser("resume", help="Resume animation")
     subparsers.add_parser("toggle-pause", help="Toggle between paused and animated")
 
-    # watcher daemon
     subparsers.add_parser("watcher", help="Run background daemon for battery & window auto-pause")
     subparsers.add_parser("battery-daemon", help="Alias for watcher daemon")
 
-    # restore
     restore_parser = subparsers.add_parser("restore", help="Restore last active wallpaper")
     restore_parser.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
 
-    # set
     set_parser = subparsers.add_parser("set", help="Set wallpaper by ID or Title search")
     set_parser.add_argument("wallpaper", help="Wallpaper ID or title substring")
     set_parser.add_argument("--fps", type=int, help="Frames per second (default 30)")
@@ -495,7 +519,6 @@ def main():
     set_parser.add_argument("--unmute", action="store_true", help="Unmute wallpaper audio")
     set_parser.add_argument("--mute", action="store_true", help="Mute wallpaper audio")
 
-    # toggle
     subparsers.add_parser("toggle", help="Toggle Wallpaper Engine on/off")
 
     args = parser.parse_args()

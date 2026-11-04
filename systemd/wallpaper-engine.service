@@ -1,7 +1,7 @@
 [Unit]
 Description=Wallpaper Engine for Hyprland
-PartOf=hyprland-session.target
-After=hyprland-session.target dms.service
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
 Type=exec
@@ -10,4 +10,4 @@ Restart=on-failure
 RestartSec=2s
 
 [Install]
-WantedBy=hyprland-session.target
+WantedBy=graphical-session.target hyprland-session.target
