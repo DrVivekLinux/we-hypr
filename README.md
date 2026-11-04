@@ -30,7 +30,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/VivekChauhanDNH/we-hypr.git
+git clone https://github.com/DrVivekLinux/we-hypr.git
 cd we-hypr
 ./install.sh
 ```
