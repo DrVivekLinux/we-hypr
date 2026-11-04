@@ -13,7 +13,7 @@ Bring your Steam Workshop wallpapers to native Wayland with automatic window-fre
 
 <br/>
 
-<img src="assets/preview.gif" alt="we-hypr Showcase Demo" width="85%" style="border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);"/>
+<img src="assets/demo.gif" alt="we-hypr interactive workflow demo" width="85%" style="border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);"/>
 
 </div>
 
@@ -90,6 +90,10 @@ Press your launcher shortcut (e.g. <kbd>Super</kbd> + <kbd>Space</kbd>) and sear
 we-hypr
 ```
 *Automatically opens in Rofi, Wofi, Fuzzel, DMS, Tofi, or Bemenu depending on what you have installed.*
+
+<div align="center">
+  <img src="assets/picker.jpg" alt="Wallpaper Engine Dropdown Picker" width="70%" style="border-radius: 10px; margin-top: 10px;"/>
+</div>
 
 ### 2. Command Line Controls
 ```bash
