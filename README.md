@@ -30,8 +30,8 @@
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/we-hypr.git
-cd we-hypr
+git clone https://github.com/VivekChauhanDNH/we-hyper.git
+cd we-hyper
 ./install.sh
 ```
 
