@@ -1,0 +1,13 @@
+[Unit]
+Description=Wallpaper Engine for Hyprland
+PartOf=hyprland-session.target
+After=hyprland-session.target dms.service
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/we-hypr restore --foreground
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=hyprland-session.target

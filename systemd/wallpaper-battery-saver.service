@@ -1,0 +1,13 @@
+[Unit]
+Description=Wallpaper Engine Auto-Pause on Battery
+PartOf=hyprland-session.target
+After=wallpaper-engine.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/we-hypr battery-daemon
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=hyprland-session.target

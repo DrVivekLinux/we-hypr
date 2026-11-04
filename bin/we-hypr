@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+we-hypr: Wallpaper Engine manager for Hyprland and Linux
+Supports native Wayland layer-shell via linux-wallpaperengine.
+Includes intelligent auto-pause for windows and battery saving.
+"""
+
+import os
+import sys
+import time
+import json
+import glob
+import socket
+import threading
+import subprocess
+import argparse
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "hypr"
+STATE_FILE = CONFIG_DIR / "wallpaper-engine.json"
+WORKSHOP_DIR = Path.home() / ".local" / "share" / "Steam" / "steamapps" / "workshop" / "content" / "431960"
+ASSETS_DIR = Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common" / "wallpaper_engine" / "assets"
+SERVICE_NAME = "wallpaper-engine.service"
+BATTERY_SERVICE_NAME = "wallpaper-battery-saver.service"
+
+DEFAULT_CONFIG = {
+    "wallpaper_id": "3581781970", # macos Tahoe Dark
+    "fps": 30,
+    "scaling": "fill",
+    "silent": True,
+    "volume": 15,
+    "layer": "bottom",
+    "hwdec": "auto",
+    "pause_on_battery": True,
+    "pause_on_windows": True,
+    "fullscreen_pause_only_active": True
+}
+
+def load_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                cfg = DEFAULT_CONFIG.copy()
+                cfg.update(data)
+                return cfg
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+def get_installed_wallpapers():
+    wallpapers = []
+    if not WORKSHOP_DIR.exists():
+        return wallpapers
+
+    for p in sorted(glob.glob(str(WORKSHOP_DIR / "*" / "project.json"))):
+        try:
+            wid = os.path.basename(os.path.dirname(p))
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+                wallpapers.append({
+                    "id": wid,
+                    "title": data.get("title", f"Wallpaper {wid}").strip(),
+                    "type": data.get("type", "scene").lower(),
+                    "path": os.path.dirname(p)
+                })
+        except Exception:
+            continue
+    return wallpapers
+
+def get_active_monitors():
+    try:
+        res = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, check=True)
+        monitors_data = json.loads(res.stdout)
+        active = [m["name"] for m in monitors_data if not m.get("disabled", False)]
+        if active:
+            return active
+    except Exception:
+        pass
+    return ["eDP-1"]
+
+def get_hyprland_socket2_path():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if sig:
+        p = Path(xdg) / "hypr" / sig / ".socket2.sock"
+        if p.exists():
+            return str(p)
+    matches = glob.glob(f"{xdg}/hypr/*/.socket2.sock")
+    return matches[0] if matches else None
+
+def has_open_windows():
+    """Returns True if there is at least one window on the active workspace of any monitor."""
+    try:
+        res = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, check=True)
+        monitors = json.loads(res.stdout)
+        res_ws = subprocess.run(["hyprctl", "workspaces", "-j"], capture_output=True, text=True, check=True)
+        workspaces = {ws["id"]: ws for ws in json.loads(res_ws.stdout)}
+
+        for mon in monitors:
+            if mon.get("disabled", False):
+                continue
+            active_ws_id = mon.get("activeWorkspace", {}).get("id")
+            if active_ws_id in workspaces:
+                ws_obj = workspaces[active_ws_id]
+                if ws_obj.get("windows", 0) > 0:
+                    return True
+                if ws_obj.get("specialWorkspace", {}).get("name"):
+                    return True
+    except Exception:
+        try:
+            res = subprocess.run(["hyprctl", "activeworkspace", "-j"], capture_output=True, text=True)
+            ws = json.loads(res.stdout)
+            return ws.get("windows", 0) > 0
+        except Exception:
+            pass
+    return False
+
+def is_service_active(service=SERVICE_NAME):
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", "--quiet", service])
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def is_on_battery():
+    # Method 1: Check sysfs AC line status
+    try:
+        acad_files = glob.glob("/sys/class/power_supply/AC*/online")
+        if acad_files:
+            with open(acad_files[0], "r") as f:
+                return f.read().strip() == "0"
+    except Exception:
+        pass
+
+    # Method 2: UPower D-Bus
+    try:
+        import dbus
+        bus = dbus.SystemBus()
+        upower = bus.get_object("org.freedesktop.UPower", "/org/freedesktop/UPower")
+        props = dbus.Interface(upower, "org.freedesktop.DBus.Properties")
+        return bool(props.Get("org.freedesktop.UPower", "OnBattery"))
+    except Exception:
+        pass
+
+    return False
+
+def should_pause(cfg=None):
+    if cfg is None:
+        cfg = load_config()
+
+    if cfg.get("pause_on_battery", True) and is_on_battery():
+        return True, "Battery power (unplugged)"
+
+    if cfg.get("pause_on_windows", True) and has_open_windows():
+        return True, "Window open/focused on active workspace"
+
+    return False, "Desktop is clear"
+
+def notify(summary, body):
+    try:
+        subprocess.run(
+            ["dms", "notify", summary, body, "-a", "Wallpaper Engine", "-u", "low", "-e"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+def get_engine_pids():
+    try:
+        res = subprocess.run(["pgrep", "-f", "linux-wallpaperengine"], capture_output=True, text=True)
+        if res.returncode == 0:
+            return [int(p) for p in res.stdout.strip().split() if p.isdigit()]
+    except Exception:
+        pass
+    return []
+
+def is_running():
+    return is_service_active() or len(get_engine_pids()) > 0
+
+def is_paused():
+    pids = get_engine_pids()
+    if not pids:
+        return False
+    try:
+        with open(f"/proc/{pids[0]}/status") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    return "T" in line
+    except Exception:
+        pass
+    return False
+
+def pause_wallpaper():
+    pids = get_engine_pids()
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, 19) # SIGSTOP
+        except Exception:
+            pass
+    return True
+
+def resume_wallpaper():
+    pids = get_engine_pids()
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, 18) # SIGCONT
+        except Exception:
+            pass
+    return True
+
+def kill_stray_instances(exclude_pid=None):
+    for pid in get_engine_pids():
+        if exclude_pid and pid == exclude_pid:
+            continue
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+def stop_wallpaper():
+    stopped = False
+    if is_service_active():
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+        stopped = True
+    kill_stray_instances()
+    return stopped or is_running()
+
+def build_command(wallpaper_id, cfg):
+    monitors = get_active_monitors()
+    cmd = ["linux-wallpaperengine"]
+
+    if ASSETS_DIR.exists():
+        cmd.extend(["--assets-dir", str(ASSETS_DIR)])
+
+    cmd.extend(["--fps", str(cfg.get("fps", 30))])
+    cmd.extend(["--scaling", str(cfg.get("scaling", "fill"))])
+    cmd.extend(["--layer", str(cfg.get("layer", "bottom"))])
+    cmd.extend(["--hwdec", str(cfg.get("hwdec", "auto"))])
+
+    if cfg.get("fullscreen_pause_only_active", True):
+        cmd.append("--fullscreen-pause-only-active")
+
+    if cfg.get("silent", True):
+        cmd.append("--silent")
+    else:
+        cmd.extend(["--volume", str(cfg.get("volume", 15))])
+
+    # Assign all active screens
+    for mon in monitors:
+        cmd.extend(["--screen-root", mon, "--bg", str(wallpaper_id)])
+
+    return cmd
+
+def run_wallpaper(wallpaper_id=None, cfg=None, foreground=False):
+    if cfg is None:
+        cfg = load_config()
+
+    if wallpaper_id:
+        cfg["wallpaper_id"] = str(wallpaper_id)
+        save_config(cfg)
+    else:
+        wallpaper_id = cfg.get("wallpaper_id", DEFAULT_CONFIG["wallpaper_id"])
+
+    # If running in foreground (e.g. systemd service):
+    if foreground:
+        kill_stray_instances(exclude_pid=os.getpid())
+        cmd = build_command(wallpaper_id, cfg)
+        os.execvp(cmd[0], cmd)
+        return True, wallpaper_id
+
+    # If systemd service is active:
+    if is_service_active():
+        subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=False)
+        return True, wallpaper_id
+
+    # Otherwise kill stray instances and launch detached
+    kill_stray_instances()
+    cmd = build_command(wallpaper_id, cfg)
+
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return True, wallpaper_id
+    except Exception as e:
+        return False, str(e)
+
+def list_wallpapers():
+    wallpapers = get_installed_wallpapers()
+    cfg = load_config()
+    current_id = cfg.get("wallpaper_id")
+    running = is_running()
+    print(f"\nDownloaded Steam Wallpapers ({len(wallpapers)} found):")
+    print("-" * 65)
+    for w in wallpapers:
+        mark = "▶ [ACTIVE] " if (w["id"] == current_id and running) else "  "
+        print(f"{mark}{w['id']:<12} | {w['type']:<7} | {w['title']}")
+    print("-" * 65)
+    status_str = "PAUSED (frozen)" if is_paused() else ("RUNNING" if running else "STOPPED")
+    print(f"Engine Status: {status_str}")
+
+def find_wallpaper(query):
+    query = str(query).strip().lower()
+    wallpapers = get_installed_wallpapers()
+    for w in wallpapers:
+        if w["id"] == query:
+            return w
+    for w in wallpapers:
+        if query in w["title"].lower():
+            return w
+    return None
+
+def pick_wallpaper_gui():
+    wallpapers = get_installed_wallpapers()
+    if not wallpapers:
+        print("No wallpapers found in Steam workshop directory.")
+        return
+
+    lines = []
+    id_map = {}
+    for w in wallpapers:
+        entry = f"{w['title']}  ({w['type']})  [{w['id']}]"
+        lines.append(entry)
+        id_map[entry] = w["id"]
+
+    menu_input = "\n".join(lines)
+
+    chosen_id = None
+    try:
+        res = subprocess.run(
+            ["dms", "dmenu", "-p", "Wallpaper Engine:"],
+            input=menu_input,
+            capture_output=True,
+            text=True
+        )
+        selected = res.stdout.strip()
+        if selected and selected in id_map:
+            chosen_id = id_map[selected]
+    except FileNotFoundError:
+        pass
+
+    if not chosen_id:
+        if sys.stdin.isatty():
+            print("\nSelect a wallpaper by number, name or ID:")
+            for idx, w in enumerate(wallpapers, 1):
+                print(f"[{idx}] {w['title']} ({w['type']}) - {w['id']}")
+            try:
+                choice = input("\nEnter selection: ").strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(wallpapers):
+                    chosen_id = wallpapers[int(choice) - 1]["id"]
+                else:
+                    matched = find_wallpaper(choice)
+                    if matched:
+                        chosen_id = matched["id"]
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                return
+
+    if chosen_id:
+        success, msg = run_wallpaper(chosen_id)
+        if success:
+            w = find_wallpaper(chosen_id)
+            title = w["title"] if w else chosen_id
+            print(f"Successfully applied: {title} ({chosen_id})")
+        else:
+            print(f"Failed to start wallpaper: {msg}")
+
+def run_watcher_daemon():
+    """Intelligent daemon that auto-pauses wallpaper on battery OR when any window is open/focused."""
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    # Small delay for initial wallpaper render
+    time.sleep(1)
+
+    def evaluate():
+        cfg = load_config()
+        need_pause, reason = should_pause(cfg)
+        paused = is_paused()
+
+        if need_pause and not paused:
+            pause_wallpaper()
+        elif not need_pause and paused:
+            resume_wallpaper()
+
+    # Initial evaluation
+    evaluate()
+
+    # 1. Listen for battery / AC power changes
+    def on_upower_changed(interface, changed, invalidated):
+        if "OnBattery" in changed:
+            on_bat = bool(changed["OnBattery"])
+            if on_bat:
+                notify("Wallpaper Engine", "Unplugged — animation paused to save battery")
+            else:
+                notify("Wallpaper Engine", "Plugged in — AC power connected")
+            evaluate()
+
+    bus.add_signal_receiver(
+        on_upower_changed,
+        signal_name="PropertiesChanged",
+        dbus_interface="org.freedesktop.DBus.Properties",
+        path="/org/freedesktop/UPower"
+    )
+
+    # 2. Background thread to listen for Hyprland window/workspace events
+    def hyprland_event_thread():
+        relevant_prefixes = ("workspace>>", "activewindow>>", "openwindow>>", "closewindow>>", "movewindow>>", "fullscreen>>")
+        while True:
+            sock_path = get_hyprland_socket2_path()
+            if not sock_path:
+                time.sleep(1)
+                continue
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(sock_path)
+                buf = ""
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                    buf += data.decode("utf-8", errors="ignore")
+                    lines = buf.split("\n")
+                    buf = lines[-1]
+                    for line in lines[:-1]:
+                        if any(line.startswith(pref) for pref in relevant_prefixes):
+                            # Small debounce delay to allow Hyprland state to settle
+                            time.sleep(0.04)
+                            GLib.idle_add(evaluate)
+            except Exception:
+                time.sleep(1)
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=hyprland_event_thread, daemon=True)
+    t.start()
+
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Wallpaper Engine CLI for Hyprland")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # default pick
+    subparsers.add_parser("pick", help="Open GUI/interactive picker to choose wallpaper")
+    subparsers.add_parser("list", help="List all downloaded wallpapers")
+    subparsers.add_parser("stop", help="Stop Wallpaper Engine")
+    subparsers.add_parser("status", help="Show current Wallpaper Engine status")
+
+    # power saving pause/resume
+    subparsers.add_parser("pause", help="Freeze animation (0%% CPU/GPU, static image)")
+    subparsers.add_parser("resume", help="Resume animation")
+    subparsers.add_parser("toggle-pause", help="Toggle between paused and animated")
+
+    # watcher daemon
+    subparsers.add_parser("watcher", help="Run background daemon for battery & window auto-pause")
+    subparsers.add_parser("battery-daemon", help="Alias for watcher daemon")
+
+    # restore
+    restore_parser = subparsers.add_parser("restore", help="Restore last active wallpaper")
+    restore_parser.add_argument("--foreground", action="store_true", help="Run in foreground (for systemd)")
+
+    # set
+    set_parser = subparsers.add_parser("set", help="Set wallpaper by ID or Title search")
+    set_parser.add_argument("wallpaper", help="Wallpaper ID or title substring")
+    set_parser.add_argument("--fps", type=int, help="Frames per second (default 30)")
+    set_parser.add_argument("--volume", type=int, help="Volume level (0-100)")
+    set_parser.add_argument("--unmute", action="store_true", help="Unmute wallpaper audio")
+    set_parser.add_argument("--mute", action="store_true", help="Mute wallpaper audio")
+
+    # toggle
+    subparsers.add_parser("toggle", help="Toggle Wallpaper Engine on/off")
+
+    args = parser.parse_args()
+
+    if args.command is None or args.command == "pick":
+        pick_wallpaper_gui()
+    elif args.command == "list":
+        list_wallpapers()
+    elif args.command == "stop":
+        if stop_wallpaper():
+            print("Stopped Wallpaper Engine.")
+        else:
+            print("Wallpaper Engine is not currently running.")
+    elif args.command == "pause":
+        if pause_wallpaper():
+            print("Wallpaper animation frozen (0% CPU / 0% GPU). Last frame kept as static wallpaper.")
+        else:
+            print("Wallpaper Engine is not running.")
+    elif args.command == "resume":
+        if resume_wallpaper():
+            print("Wallpaper animation resumed.")
+        else:
+            print("Wallpaper Engine is not running.")
+    elif args.command == "toggle-pause":
+        if is_paused():
+            resume_wallpaper()
+            print("Wallpaper animation resumed.")
+        else:
+            pause_wallpaper()
+            print("Wallpaper animation frozen (0% CPU / 0% GPU).")
+    elif args.command in ("watcher", "battery-daemon"):
+        run_watcher_daemon()
+    elif args.command == "status":
+        cfg = load_config()
+        running = is_running()
+        paused = is_paused()
+        w = find_wallpaper(cfg.get("wallpaper_id", ""))
+        title = w["title"] if w else "Unknown"
+        audio_str = "Muted" if cfg.get("silent") else f"Volume {cfg.get('volume', 15)}%"
+        service_str = "Active" if is_service_active() else "Inactive"
+        watcher_str = "Active" if is_service_active(BATTERY_SERVICE_NAME) else "Inactive"
+        power_str = "Battery (Unplugged)" if is_on_battery() else "AC Power (Plugged in)"
+        windows_open = has_open_windows()
+
+        if paused:
+            reason = "Paused on Battery" if is_on_battery() else "Paused (Window open/focused)"
+            state_str = f"PAUSED ({reason} — 0% CPU/GPU)"
+        elif running:
+            state_str = "RUNNING (Active animated)"
+        else:
+            state_str = "STOPPED"
+
+        print(f"Status:             {state_str}")
+        print(f"Wallpaper:          {title} ({cfg.get('wallpaper_id')})")
+        print(f"Power Source:       {power_str}")
+        print(f"Active Windows:     {'Yes (windows open on active workspace)' if windows_open else 'No (empty desktop)'}")
+        print(f"Auto-Pause Watcher: {watcher_str}")
+        print(f"  ├─ On Battery:    Enabled")
+        print(f"  └─ On Windows:    Enabled (pauses whenever any window is open)")
+        print(f"Target FPS:         {cfg.get('fps', 30)}")
+        print(f"Hardware Dec:       {cfg.get('hwdec', 'auto')} (GPU Accelerated)")
+        print(f"Audio:              {audio_str}")
+    elif args.command == "restore":
+        cfg = load_config()
+        run_wallpaper(cfg.get("wallpaper_id"), cfg, foreground=args.foreground)
+    elif args.command == "set":
+        target = find_wallpaper(args.wallpaper)
+        if not target:
+            target_id = args.wallpaper
+            title = target_id
+        else:
+            target_id = target["id"]
+            title = target["title"]
+
+        cfg = load_config()
+        if args.fps:
+            cfg["fps"] = args.fps
+        if args.volume is not None:
+            cfg["volume"] = args.volume
+            cfg["silent"] = False
+        if args.mute:
+            cfg["silent"] = True
+        if args.unmute:
+            cfg["silent"] = False
+
+        success, msg = run_wallpaper(target_id, cfg)
+        if success:
+            print(f"Applied: {title} ({target_id})")
+        else:
+            print(f"Failed to apply: {msg}")
+    elif args.command == "toggle":
+        if is_running():
+            stop_wallpaper()
+            print("Wallpaper Engine stopped.")
+        else:
+            cfg = load_config()
+            run_wallpaper(cfg.get("wallpaper_id"), cfg)
+            print("Wallpaper Engine started.")
+
+if __name__ == "__main__":
+    main()
