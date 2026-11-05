@@ -15,16 +15,15 @@ mkdir -p "$HOME/.local/share/applications"
 install -m 755 "$SCRIPT_DIR/bin/we-hypr" "$HOME/.local/bin/we-hypr"
 ln -sf "$HOME/.local/bin/we-hypr" "$HOME/.local/bin/hypr-we"
 
-# Copy systemd units
+# Copy unified systemd unit
 install -m 644 "$SCRIPT_DIR/systemd/wallpaper-engine.service" "$HOME/.config/systemd/user/wallpaper-engine.service"
-install -m 644 "$SCRIPT_DIR/systemd/wallpaper-battery-saver.service" "$HOME/.config/systemd/user/wallpaper-battery-saver.service"
 
 # Copy desktop file
 install -m 644 "$SCRIPT_DIR/applications/we-picker.desktop" "$HOME/.local/share/applications/we-picker.desktop"
 
-# Reload systemd and enable services
+# Reload systemd and enable service
 systemctl --user daemon-reload
-systemctl --user enable --now wallpaper-engine.service wallpaper-battery-saver.service
+systemctl --user enable --now wallpaper-engine.service
 
 # Update desktop database
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true

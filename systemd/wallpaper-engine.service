@@ -1,11 +1,10 @@
 [Unit]
 Description=Wallpaper Engine for Hyprland
-PartOf=graphical-session.target
-After=graphical-session.target
+PartOf=graphical-session.target hyprland-session.target
 
 [Service]
-Type=exec
-ExecStart=%h/.local/bin/we-hypr restore --foreground
+Type=simple
+ExecStart=%h/.local/bin/we-hypr daemon
 Restart=on-failure
 RestartSec=2s
 
