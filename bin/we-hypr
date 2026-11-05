@@ -23,6 +23,21 @@ STATE_FILE = CONFIG_DIR / "wallpaper-engine.json"
 WORKSHOP_DIR = Path.home() / ".local" / "share" / "Steam" / "steamapps" / "workshop" / "content" / "431960"
 ASSETS_DIR = Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common" / "wallpaper_engine" / "assets"
 SERVICE_NAME = "wallpaper-engine.service"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+MANUAL_PAUSE_FILE = RUNTIME_DIR / "we-hypr.manual_pause"
+
+def is_manually_paused():
+    return MANUAL_PAUSE_FILE.exists()
+
+def set_manual_pause(paused: bool):
+    try:
+        if paused:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            MANUAL_PAUSE_FILE.touch()
+        else:
+            MANUAL_PAUSE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 DEFAULT_CONFIG = {
     "wallpaper_id": "3581781970",
@@ -162,6 +177,9 @@ def is_on_battery():
     return False
 
 def should_pause(cfg=None):
+    if is_manually_paused():
+        return True, "Manually paused (hold active)"
+
     if cfg is None:
         cfg = load_config()
 
@@ -222,6 +240,7 @@ def is_paused():
     return False
 
 def pause_wallpaper():
+    set_manual_pause(True)
     pids = get_engine_pids()
     if not pids:
         return False
@@ -230,18 +249,28 @@ def pause_wallpaper():
             os.kill(pid, 19) # SIGSTOP
         except Exception:
             pass
+    notify("Wallpaper Engine", "Wallpaper animation paused (manual hold active)")
     return True
 
 def resume_wallpaper():
+    set_manual_pause(False)
     pids = get_engine_pids()
     if not pids:
-        return False
-    for pid in pids:
-        try:
-            os.kill(pid, 18) # SIGCONT
-        except Exception:
-            pass
-    return True
+        return False, "Wallpaper Engine is not running."
+
+    cfg = load_config()
+    need_pause, reason = should_pause(cfg)
+    if not need_pause:
+        for pid in pids:
+            try:
+                os.kill(pid, 18) # SIGCONT
+            except Exception:
+                pass
+        notify("Wallpaper Engine", "Wallpaper animation resumed")
+        return True, "Wallpaper animation resumed (normal auto-pause mode active)."
+    else:
+        notify("Wallpaper Engine", f"Manual pause released ({reason})")
+        return True, f"Manual pause released (animation will play when {reason.lower() if 'clear' in reason.lower() else 'desktop is clear and plugged in'})."
 
 def kill_stray_instances(exclude_pid=None):
     for pid in get_engine_pids():
@@ -253,6 +282,7 @@ def kill_stray_instances(exclude_pid=None):
             pass
 
 def stop_wallpaper():
+    set_manual_pause(False)
     stopped = False
     if is_service_active():
         subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -312,6 +342,9 @@ def run_service():
     Unified daemon: Runs linux-wallpaperengine under direct supervision,
     while concurrently monitoring power & Hyprland window events to auto-pause.
     """
+    # Ensure any leftover manual pause is cleared on boot / service restart
+    set_manual_pause(False)
+
     cfg = load_config()
     wallpaper_id = cfg.get("wallpaper_id", DEFAULT_CONFIG["wallpaper_id"])
 
@@ -446,6 +479,7 @@ def run_service():
         cleanup_handler(None, None)
 
 def run_wallpaper(wallpaper_id=None, cfg=None):
+    set_manual_pause(False)
     if cfg is None:
         cfg = load_config()
 
@@ -588,9 +622,9 @@ def main():
     subparsers.add_parser("stop", help="Stop Wallpaper Engine")
     subparsers.add_parser("status", help="Show current Wallpaper Engine status")
 
-    subparsers.add_parser("pause", help="Freeze animation (0%% CPU/GPU, static image)")
-    subparsers.add_parser("resume", help="Resume animation")
-    subparsers.add_parser("toggle-pause", help="Toggle between paused and animated")
+    subparsers.add_parser("pause", help="Freeze animation with manual hold (stays paused across workspaces)")
+    subparsers.add_parser("resume", help="Release manual pause and resume animation")
+    subparsers.add_parser("toggle-pause", help="Toggle between manual hold and animated")
 
     # Unified daemon / service
     subparsers.add_parser("daemon", help="Run unified engine + auto-pause daemon (for systemd)")
@@ -624,27 +658,28 @@ def main():
             print("Wallpaper Engine is not currently running.")
     elif args.command == "pause":
         if pause_wallpaper():
-            print("Wallpaper animation frozen (0% CPU / 0% GPU). Last frame kept as static wallpaper.")
+            print("Wallpaper animation paused (manual hold active until turned back on).")
         else:
             print("Wallpaper Engine is not running.")
     elif args.command == "resume":
-        if resume_wallpaper():
-            print("Wallpaper animation resumed.")
-        else:
-            print("Wallpaper Engine is not running.")
+        success, msg = resume_wallpaper()
+        print(msg)
     elif args.command == "toggle-pause":
-        if is_paused():
-            resume_wallpaper()
-            print("Wallpaper animation resumed.")
+        if is_manually_paused():
+            success, msg = resume_wallpaper()
+            print(msg)
         else:
-            pause_wallpaper()
-            print("Wallpaper animation frozen (0% CPU / 0% GPU).")
+            if pause_wallpaper():
+                print("Wallpaper animation paused (manual hold active until turned back on).")
+            else:
+                print("Wallpaper Engine is not running.")
     elif args.command in ("daemon", "service", "watcher"):
         run_service()
     elif args.command == "status":
         cfg = load_config()
         running = is_running()
         paused = is_paused()
+        manually_paused = is_manually_paused()
         w = find_wallpaper(cfg.get("wallpaper_id", ""))
         title = w["title"] if w else "Unknown"
         audio_str = "Muted" if cfg.get("silent") else f"Volume {cfg.get('volume', 15)}%"
@@ -652,7 +687,9 @@ def main():
         power_str = "Battery (Unplugged)" if is_on_battery() else "AC Power (Plugged in)"
         windows_open = has_open_windows()
 
-        if paused:
+        if manually_paused:
+            state_str = "PAUSED (Manual hold active — 0% CPU/GPU)"
+        elif paused:
             reason = "Paused on Battery" if is_on_battery() else "Paused (Window open/focused)"
             state_str = f"PAUSED ({reason} — 0% CPU/GPU)"
         elif running:
@@ -662,6 +699,7 @@ def main():
 
         print(f"Status:             {state_str}")
         print(f"Wallpaper:          {title} ({cfg.get('wallpaper_id')})")
+        print(f"Manual Pause Hold:  {'Active (run \"we-hypr resume\" to unpause)' if manually_paused else 'Inactive'}")
         print(f"Power Source:       {power_str}")
         print(f"Active Windows:     {'Yes (windows open on active workspace)' if windows_open else 'No (empty desktop)'}")
         print(f"Systemd Service:    {service_str}")
